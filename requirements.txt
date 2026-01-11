@@ -1,0 +1,6 @@
+numpy<2.0.0
+sentence-transformers
+umap-learn
+hdbscan
+pillow
+tqdm

@@ -1,0 +1,418 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Latent Atlas</title>
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/pixi.js/6.5.9/browser/pixi.min.js"></script>
+    <script src="https://cdn.jsdelivr.net/gh/davidfig/pixi-viewport@v4.34.4/dist/viewport.min.js"></script>
+    <style>
+        :root { --accent: #3b82f6; --bg-glass: rgba(255, 255, 255, 0.9); }
+        body { margin: 0; overflow: hidden; background-color: #f1f5f9; font-family: -apple-system, sans-serif; user-select: none; color: #1e293b; }
+        #app { width: 100vw; height: 100vh; display: block; cursor: grab; }
+        #app:active { cursor: grabbing; }
+
+        /* UI */
+        #ui-panel { position: fixed; top: 20px; left: 20px; width: 260px; background: var(--bg-glass); backdrop-filter: blur(10px); padding: 16px; border-radius: 16px; display: flex; flex-direction: column; gap: 12px; z-index: 100; border: 1px solid rgba(255,255,255,0.5); box-shadow: 0 4px 20px rgba(0,0,0,0.1); }
+        .ui-row { display: flex; align-items: center; gap: 10px; }
+        .ui-hint { font-size: 11px; color: #94a3b8; text-align: center; margin-top: 4px; font-style: italic; }
+        input[type="text"] { width: 100%; padding: 8px 12px; border-radius: 8px; border: 1px solid #cbd5e1; outline: none; }
+        input[type="range"] { flex: 1; cursor: pointer; }
+        button { padding: 8px 12px; border-radius: 8px; border: none; background: #e2e8f0; color: #475569; font-weight: 600; cursor: pointer; display: flex; align-items: center; justify-content: center; width: 100%; gap: 6px; }
+        button:hover { background: #cbd5e1; color: #1e293b; }
+
+        /* Tooltip */
+        #tooltip { position: fixed; display: none; pointer-events: none; z-index: 1000; background: rgba(255,255,255,0.98); border-radius: 12px; box-shadow: 0 20px 50px rgba(0,0,0,0.2); width: 320px; overflow: hidden; }
+        .tt-header { padding: 12px 16px; background: #fff; border-bottom: 1px solid #f1f5f9; display: flex; justify-content: space-between; align-items: center; }
+        .tt-date { font-weight: 700; font-size: 15px; }
+        .tt-cluster { font-size: 11px; font-weight: 700; color: #64748b; display: flex; align-items: center; gap: 6px; }
+        .color-dot { width: 8px; height: 8px; border-radius: 50%; display: inline-block; }
+        .tt-img-wrapper { width: 100%; height: 260px; background: #e2e8f0; display: flex; justify-content: center; align-items: center; overflow: hidden; }
+        #tt-preview { max-width: 100%; max-height: 100%; object-fit: contain; }
+        .tt-body { padding: 12px 16px; }
+        .tt-tags { display: flex; flex-wrap: wrap; gap: 6px; margin-bottom: 12px; }
+        .tt-tag { font-size: 11px; background: #eff6ff; padding: 4px 8px; border-radius: 6px; color: #3b82f6; border: 1px solid #dbeafe; font-weight: 500; }
+        .tt-filename { font-size: 10px; color: #94a3b8; font-family: monospace; border-top: 1px solid #f1f5f9; padding-top: 8px; }
+
+        #loader { position: absolute; inset: 0; background: #f1f5f9; display: flex; flex-direction: column; justify-content: center; align-items: center; z-index: 2000; transition: opacity 0.5s; }
+        .spinner { width: 40px; height: 40px; border: 4px solid rgba(0,0,0,0.1); border-top: 4px solid var(--accent); border-radius: 50%; animation: spin 0.8s infinite linear; margin-bottom: 20px; }
+        @keyframes spin { 100% { transform: rotate(360deg); } }
+    </style>
+</head>
+<body>
+
+<div id="loader"><div class="spinner"></div><div id="status">Initializing...</div></div>
+
+<div id="ui-panel">
+    <div class="ui-row">🔍<input type="text" id="search-input" placeholder="Search..."></div>
+    <div class="ui-row"><span style="font-size:12px;font-weight:600;color:#64748b">Scale</span><input type="range" id="scale-slider" min="0.5" max="3.0" step="0.1" value="1.0"></div>
+    <div class="ui-row"><button id="btn-home">🏠 Reset View</button></div>
+    <div class="ui-hint">Hold <b>Shift</b> to view details</div>
+</div>
+
+<div id="app"></div>
+
+<div id="tooltip">
+    <div class="tt-header">
+        <div class="tt-date" id="tt-date"></div>
+        <div class="tt-cluster"><span id="tt-dot" class="color-dot"></span><span id="tt-cluster-id"></span></div>
+    </div>
+    <div class="tt-img-wrapper"><img id="tt-preview" src=""></div>
+    <div class="tt-body"><div id="tt-tags" class="tt-tags"></div><div id="tt-filename" class="tt-filename"></div></div>
+</div>
+
+<script>
+    const CONFIG = {
+        bgColor: 0xf1f5f9,
+        baseScale: 1.0,
+        hoverMult: 1.2,
+        dotSize: 0.15,
+        zoomThreshold: 5.0,
+        hiResPxThreshold: 300,
+        thumbSize: 128,
+        lerpSpeed: 0.2,
+        throttleMs: 15,
+        fetchUrl: './clusters.json'
+    };
+
+    const state = {
+        app: null, viewport: null,
+        points: [], atlasTextures: {},
+        loadingQueue: [],
+        activeHover: null,
+        isDragging: false,
+        isTooltipKeyHeld: false // Track modifier key
+    };
+
+    const hslToHex = (h,s,l) => {l/=100;const a=s*Math.min(l,1-l)/100;const f=n=>{const k=(n+h/30)%12;const c=l-a*Math.max(Math.min(k-3,9-k,1),-1);return Math.round(255*c).toString(16).padStart(2,"0")};return parseInt(`0x${f(0)}${f(8)}${f(4)}`)};
+    const lerp = (a, b, t) => a + (b - a) * t;
+
+    function getIdealDimensions(texture, boxSize) {
+        if (!texture) return { w: boxSize, h: boxSize };
+        const ar = texture.width / texture.height;
+        return ar >= 1 ? { w: boxSize, h: boxSize / ar } : { w: boxSize * ar, h: boxSize };
+    }
+
+    async function init() {
+        if (typeof PIXI === 'undefined') { alert("PixiJS failed to load"); return; }
+
+        PIXI.settings.SCALE_MODE = PIXI.SCALE_MODES.LINEAR;
+        state.app = new PIXI.Application({ resizeTo: window, backgroundColor: CONFIG.bgColor, antialias: true, resolution: window.devicePixelRatio || 1 });
+        document.getElementById('app').appendChild(state.app.view);
+
+        const Viewport = pixi_viewport.Viewport;
+        state.viewport = new Viewport({ screenWidth: window.innerWidth, screenHeight: window.innerHeight, worldWidth: 1000, worldHeight: 1000, interaction: state.app.renderer.plugins.interaction });
+        state.app.stage.addChild(state.viewport);
+        state.viewport.drag().pinch().wheel().decelerate().clampZoom({ minScale: 0.1, maxScale: 100000 });
+
+        state.viewport.on('drag-start', () => { state.isDragging = true; document.body.style.cursor = 'grabbing'; });
+        state.viewport.on('drag-end', () => { state.isDragging = false; document.body.style.cursor = 'grab'; });
+
+        // --- Key Listeners (Shift, Alt, Control) ---
+        window.addEventListener('keydown', (e) => {
+            if (e.key === 'Shift' || e.key === 'Alt' || e.key === 'Control') {
+                state.isTooltipKeyHeld = true;
+                // Immediate update if currently hovering
+                if (state.activeHover) updateTooltip(state.activeHover);
+            }
+        });
+
+        window.addEventListener('keyup', (e) => {
+            if (e.key === 'Shift' || e.key === 'Alt' || e.key === 'Control') {
+                state.isTooltipKeyHeld = false;
+                updateTooltip(state.activeHover); // Will hide it
+            }
+        });
+
+        const status = document.getElementById('status');
+        let rawData;
+        try {
+            const res = await fetch(CONFIG.fetchUrl);
+            rawData = await res.json();
+        } catch(e) { status.innerText = "Error loading clusters.json"; return; }
+
+        status.innerText = "Loading Atlas...";
+        const atlasIds = [...new Set(rawData.map(p => p.atlas_id))];
+        await Promise.all(atlasIds.map(id =>
+            PIXI.Texture.fromURL(`./thumbs/atlas_${id}.webp`).then(t => {
+                t.baseTexture.scaleMode = PIXI.SCALE_MODES.NEAREST;
+                state.atlasTextures[id] = t.baseTexture;
+            })
+        ));
+
+        status.innerText = "Building...";
+        setupScene(rawData);
+
+        state.app.ticker.add(renderLoop);
+        startLoader();
+        setupUI();
+
+        const loader = document.getElementById('loader');
+        loader.style.opacity = 0;
+        setTimeout(() => loader.remove(), 600);
+    }
+
+    function setupScene(data) {
+        const layers = { cloud: new PIXI.Container(), dots: new PIXI.Container(), halos: new PIXI.Container(), images: new PIXI.Container() };
+        layers.images.sortableChildren = true;
+        state.viewport.addChild(layers.cloud, layers.dots, layers.halos, layers.images);
+
+        const gCloud = new PIXI.Graphics();
+        const gDots = new PIXI.Graphics();
+        let bounds = { minX: Infinity, maxX: -Infinity, minY: Infinity, maxY: -Infinity };
+
+        data.forEach(p => {
+            const color = (p.cluster === -1) ? 0x94a3b8 : hslToHex((p.cluster * 137.508) % 360, 65, 50);
+            bounds.minX = Math.min(bounds.minX, p.x); bounds.maxX = Math.max(bounds.maxX, p.x);
+            bounds.minY = Math.min(bounds.minY, p.y); bounds.maxY = Math.max(bounds.maxY, p.y);
+
+            gCloud.beginFill(color, 0.08); gCloud.drawCircle(p.x, p.y, 2.0); gCloud.endFill();
+            gDots.beginFill(color); gDots.drawCircle(p.x, p.y, CONFIG.dotSize); gDots.endFill();
+
+            state.points.push({
+                ...p, color, filename: p.image.split('/').pop(),
+                sprite: null, halo: null, visible: true,
+                isHighRes: false, isLoadingHighRes: false, highResTex: null
+            });
+        });
+
+        const blur = new PIXI.filters.BlurFilter();
+        blur.strength = 10; blur.quality = 4;
+        layers.cloud.addChild(gCloud); layers.cloud.filters = [blur];
+        layers.dots.addChild(gDots);
+
+        state.layers = layers;
+        state.gDots = gDots;
+        state.bounds = bounds;
+
+        const w = bounds.maxX - bounds.minX; const h = bounds.maxY - bounds.minY;
+        state.viewport.moveCenter(bounds.minX + w/2, bounds.minY + h/2);
+        state.viewport.fit(true, w * 1.1, h * 1.1);
+    }
+
+    function renderLoop() {
+        if (state.viewport.dirty) state.viewport.dirty = false;
+
+        const zoom = state.viewport.scale.x;
+        const showImages = zoom > CONFIG.zoomThreshold;
+        const viewBounds = state.viewport.getVisibleBounds();
+        const mouse = state.app.renderer.plugins.interaction.mouse.getLocalPosition(state.viewport);
+
+        state.layers.dots.visible = !showImages;
+        state.layers.images.visible = showImages;
+        state.layers.halos.visible = showImages;
+
+        if (!showImages) state.loadingQueue.length = 0;
+
+        let closestDistSq = Infinity;
+        let nextHover = null;
+        const hitThreshold = showImages ? (CONFIG.baseScale / 1.5) : (CONFIG.dotSize * 15 / zoom);
+        const hitThresholdSq = hitThreshold * hitThreshold;
+
+        for (let i = 0; i < state.points.length; i++) {
+            const p = state.points[i];
+            if (!p.visible) continue;
+
+            const pad = 2;
+            const inView = (p.x > viewBounds.x - pad && p.x < viewBounds.x + viewBounds.width + pad &&
+                p.y > viewBounds.y - pad && p.y < viewBounds.y + viewBounds.height + pad);
+
+            if (!inView) {
+                manageVisuals(p, false);
+                unloadHighRes(p);
+                continue;
+            }
+
+            if (showImages) {
+                manageVisuals(p, true);
+                updateLOD(p, zoom);
+
+                if (!state.isDragging) {
+                    const dx = p.x - mouse.x; const dy = p.y - mouse.y;
+                    const dSq = dx*dx + dy*dy;
+                    if (dSq < hitThresholdSq && dSq < closestDistSq) { closestDistSq = dSq; nextHover = p; }
+                }
+
+                if (p.sprite) {
+                    const isTarget = (p === state.activeHover);
+                    const scaleMult = isTarget ? CONFIG.hoverMult : 1.0;
+                    const dims = getIdealDimensions(p.sprite.texture, CONFIG.baseScale * scaleMult);
+                    p.sprite.width = lerp(p.sprite.width, dims.w, CONFIG.lerpSpeed);
+                    p.sprite.height = lerp(p.sprite.height, dims.h, CONFIG.lerpSpeed);
+                    p.sprite.zIndex = isTarget ? 1000 : 1;
+
+                    if (p.halo) {
+                        if (isTarget) { p.halo.scale.set(1.5); p.halo.alpha = 1.0; }
+                        else { p.halo.scale.set(1.0); p.halo.alpha = 0.5; }
+                        p.halo.rotation = Math.PI / 4;
+                    }
+                }
+            } else {
+                if (!state.isDragging) {
+                    const dx = p.x - mouse.x; const dy = p.y - mouse.y;
+                    const dSq = dx*dx + dy*dy;
+                    if (dSq < hitThresholdSq && dSq < closestDistSq) { closestDistSq = dSq; nextHover = p; }
+                }
+            }
+        }
+
+        if (showImages) state.layers.images.sortChildren();
+
+        if (nextHover !== state.activeHover) {
+            state.activeHover = nextHover;
+            updateTooltip(nextHover);
+        }
+
+        if (state.activeHover && !state.isDragging && state.isTooltipKeyHeld) {
+            const mg = state.app.renderer.plugins.interaction.mouse.global;
+            moveTooltip(mg.x, mg.y);
+        }
+    }
+
+    function manageVisuals(p, shouldExist) {
+        if (shouldExist) {
+            if (!p.halo) {
+                const h = new PIXI.Graphics();
+                const s = CONFIG.baseScale * 0.8;
+                h.beginFill(p.color, 0.1).drawRect(-s/2, -s/2, s, s).endFill();
+                h.lineStyle(0.04, p.color, 0.8).drawRect(-s/2, -s/2, s, s);
+                h.x = p.x; h.y = p.y; h.rotation = Math.PI/4; h.alpha = 0.5;
+                state.layers.halos.addChild(h);
+                p.halo = h;
+            }
+            if (!p.sprite) {
+                const baseTex = state.atlasTextures[p.atlas_id];
+                if (baseTex) {
+                    const tex = new PIXI.Texture(baseTex, new PIXI.Rectangle(p.atlas_x, p.atlas_y, CONFIG.thumbSize, CONFIG.thumbSize));
+                    const s = new PIXI.Sprite(tex);
+                    s.anchor.set(0.5); s.x = p.x; s.y = p.y; s.width = CONFIG.baseScale; s.height = CONFIG.baseScale;
+                    state.layers.images.addChild(s);
+                    p.sprite = s;
+                }
+            }
+        } else {
+            if (p.sprite) { p.sprite.destroy(); p.sprite = null; }
+            if (p.halo) { p.halo.destroy(); p.halo = null; }
+        }
+    }
+
+    function updateLOD(p, zoom) {
+        if (!p.sprite) return;
+        const pixelWidth = p.sprite.width * zoom;
+        const needsHighRes = pixelWidth > CONFIG.hiResPxThreshold;
+
+        if (needsHighRes && !p.isHighRes && !p.isLoadingHighRes) {
+            if (!state.loadingQueue.includes(p)) state.loadingQueue.push(p);
+        }
+        else if (!needsHighRes && p.isHighRes) {
+            unloadHighRes(p);
+            const baseTex = state.atlasTextures[p.atlas_id];
+            if (baseTex) {
+                p.sprite.texture = new PIXI.Texture(baseTex, new PIXI.Rectangle(p.atlas_x, p.atlas_y, CONFIG.thumbSize, CONFIG.thumbSize));
+                const scaleMult = (p === state.activeHover) ? CONFIG.hoverMult : 1.0;
+                p.sprite.width = CONFIG.baseScale * scaleMult;
+                p.sprite.height = CONFIG.baseScale * scaleMult;
+            }
+        }
+    }
+
+    function unloadHighRes(p) {
+        if (p.highResTex) { p.highResTex.destroy(true); p.highResTex = null; }
+        p.isHighRes = false; p.isLoadingHighRes = false;
+    }
+
+    function startLoader() {
+        setInterval(() => {
+            if (state.loadingQueue.length === 0) return;
+            const p = state.loadingQueue.shift();
+            if (p.visible && p.sprite && !p.isHighRes && !p.isLoadingHighRes) {
+                p.isLoadingHighRes = true;
+                PIXI.Texture.fromURL(p.image).then(tex => {
+                    if (p.sprite && p.isLoadingHighRes) {
+                        p.highResTex = tex; p.sprite.texture = tex;
+                        p.isHighRes = true; p.isLoadingHighRes = false;
+                        const scaleMult = (p === state.activeHover) ? CONFIG.hoverMult : 1.0;
+                        const dims = getIdealDimensions(tex, CONFIG.baseScale * scaleMult);
+                        p.sprite.width = dims.w; p.sprite.height = dims.h;
+                    } else { tex.destroy(true); }
+                }).catch(() => { p.isLoadingHighRes = false; });
+            }
+        }, CONFIG.throttleMs);
+    }
+
+    function setupUI() {
+        const el = { search: document.getElementById('search-input'), slider: document.getElementById('scale-slider'), btnHome: document.getElementById('btn-home'), app: document.getElementById('app') };
+
+        let debounce;
+        el.search.addEventListener('input', e => {
+            clearTimeout(debounce);
+            debounce = setTimeout(() => {
+                const q = e.target.value.toLowerCase();
+                state.gDots.clear();
+                const matches = [];
+
+                state.points.forEach(p => {
+                    const isMatch = !q || p.filename.toLowerCase().includes(q) || p.tags.some(t=>t.toLowerCase().includes(q));
+                    p.visible = isMatch;
+                    if (isMatch) {
+                        state.gDots.beginFill(p.color).drawCircle(p.x, p.y, CONFIG.dotSize).endFill();
+                        if(q) matches.push(p);
+                    } else {
+                        state.gDots.beginFill(0xcccccc, 0.3).drawCircle(p.x, p.y, CONFIG.dotSize).endFill();
+                        manageVisuals(p, false); unloadHighRes(p);
+                    }
+                });
+
+                if(q && matches.length) {
+                    let mx=Infinity, Mx=-Infinity, my=Infinity, My=-Infinity;
+                    matches.forEach(p => { mx=Math.min(mx,p.x); Mx=Math.max(Mx,p.x); my=Math.min(my,p.y); My=Math.max(My,p.y); });
+                    const w = Mx-mx; const h = My-my;
+                    const scale = Math.min(state.app.renderer.width/Math.max(w,2), state.app.renderer.height/Math.max(h,2)) * 0.8;
+                    state.viewport.animate({ position: new PIXI.Point(mx+w/2, my+h/2), scale: Math.min(scale, 50), time: 800 });
+                }
+            }, 500);
+        });
+
+        el.slider.addEventListener('input', e => CONFIG.baseScale = parseFloat(e.target.value));
+
+        el.btnHome.addEventListener('click', () => {
+            const b = state.bounds; const w = b.maxX-b.minX; const h = b.maxY-b.minY;
+            state.viewport.resize(window.innerWidth, window.innerHeight, w, h);
+            state.viewport.moveCenter(b.minX+w/2, b.minY+h/2);
+            state.viewport.fit(true, w*1.1, h*1.1);
+        });
+
+        el.app.addEventListener('pointerup', e => {
+            if (!state.isDragging && state.activeHover) window.open(state.activeHover.image, '_blank');
+        });
+    }
+
+    function updateTooltip(p) {
+        const el = document.getElementById('tooltip');
+        // Show only if P exists, not dragging, AND KEY HELD
+        if (p && !state.isDragging && state.isTooltipKeyHeld) {
+            el.style.display = 'block';
+            document.getElementById('tt-date').innerText = p.date || "Unknown";
+            document.getElementById('tt-cluster-id').innerText = p.cluster === -1 ? "NOISE" : `CLUSTER ${p.cluster}`;
+            document.getElementById('tt-dot').style.backgroundColor = '#' + p.color.toString(16).padStart(6, '0');
+            document.getElementById('tt-filename').innerText = p.filename;
+            document.getElementById('tt-tags').innerHTML = p.tags.slice(0, 10).map(t=>`<span class="tt-tag">${t}</span>`).join('');
+            document.getElementById('tt-preview').src = p.image;
+        } else {
+            el.style.display = 'none';
+            document.getElementById('tt-preview').src = "";
+        }
+    }
+
+    function moveTooltip(x, y) {
+        const el = document.getElementById('tooltip');
+        let tx = x + 20; let ty = y + 20;
+        if (tx + 340 > window.innerWidth) tx -= 360;
+        if (ty + 380 > window.innerHeight) ty -= 400;
+        el.style.left = `${tx}px`; el.style.top = `${ty}px`;
+    }
+
+    init();
+</script>
+</body>
+</html>
