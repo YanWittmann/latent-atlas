@@ -89,3 +89,7 @@ Process complete. Output: I:\projects\latent-atlas\projects\demo\clusters.json
 Enjoy an image of a larger distribution below.
 
 ![Example of a larger image atlas](doc/example-2.png)
+
+---
+
+Thanks to github.com/henrydaum/Macrodata-Refinement for their efforts and reference code!
